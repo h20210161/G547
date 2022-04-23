@@ -1,212 +1,482 @@
-#include<linux/module.h>
-#include<linux/moduleparam.h>
-#include<linux/version.h>
-#include<linux/kernel.h>
-#include<linux/types.h>
-#include<linux/kdev_t.h>
-#include<linux/fs.h>
-#include<linux/device.h>
-#include<linux/cdev.h>
-#include<linux/random.h>
-
-#include "char_dev_adc.h"
-
-
-#define SUCCESS 0
-
-
-static dev_t number;/*Global variable storing the major and minor number*/
-static struct cdev cdev_adc;//character device structure
-static struct class *cls;//variable for device class
-
-/*-----------------------------------------------------------------------*/
-//definition of system calls
-
-int L,O;//used further for givig data output
-uint16_t m;
+/* DISK ON FILE(DOF) BLOCK DEVICE DRIVER Driver */
+#include <linux/string.h>
+#include <linux/types.h>
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/version.h>
+#include <linux/fs.h>
+#include <linux/spinlock.h>
+#include <linux/genhd.h> // For basic block driver framework
+#include <linux/blkdev.h> // For at least, struct block_device_operations
+#include <linux/hdreg.h> // For struct hd_geometry
+#include <linux/errno.h>
+#include <linux/vmalloc.h>
+#include <asm/segment.h>
+#include <asm/uaccess.h>
+#include <linux/buffer_head.h>
 
 
-static int adc_open(struct inode *i, struct file *f)
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof(*a))
+
+#define SECTOR_SIZE 512
+#define MBR_SIZE SECTOR_SIZE
+#define MBR_DISK_SIGNATURE_OFFSET 440
+#define MBR_DISK_SIGNATURE_SIZE 4
+#define PARTITION_TABLE_OFFSET 446
+#define PARTITION_ENTRY_SIZE 16 // sizeof(PartEntry)
+#define PARTITION_TABLE_SIZE 64 // sizeof(PartTable)
+#define MBR_SIGNATURE_OFFSET 510
+#define MBR_SIGNATURE_SIZE 2
+#define MBR_SIGNATURE 0xAA55
+#define BR_SIZE SECTOR_SIZE
+#define BR_SIGNATURE_OFFSET 510
+#define BR_SIGNATURE_SIZE 2
+#define BR_SIGNATURE 0xAA55
+
+#define DOF_FIRST_MINOR 0
+#define DOF_MINOR_CNT 16
+
+#define DOF_SECTOR_SIZE 512
+#define DOF_DEVICE_SIZE 1024 /* sectors */
+/* So, total device size = 1024 * 512 bytes = 512 KiB ( Since 1 sector = 512 Bytes) */
+
+/* Array where the disk stores its data */
+static u8 *dev_data;
+
+/* Major number to be reserved */
+static u_int dof_major = 0;  
+
+//--------------------Partition Table Entry struture---------------------------
+//Struture that stores the entried of the partition table in the DOS partition
+//table format.(16 Bytes)
+//-----------------------------------------------------------------------------
+typedef struct
 {
-	printk(KERN_ALERT"Opening the file\n");
-	return 0;
-}
-static int adc_close(struct inode *i, struct file *f)
+	unsigned char boot_type; // 0x00 - Inactive; 0x80 - Active (Bootable)
+	unsigned char start_head;
+	unsigned char start_sec:6;
+	unsigned char start_cyl_hi:2;
+	unsigned char start_cyl;
+	unsigned char part_type;
+	unsigned char end_head;
+	unsigned char end_sec:6;
+	unsigned char end_cyl_hi:2;
+	unsigned char end_cyl;
+	unsigned int abs_start_sec;
+	unsigned int sec_in_part;
+} PartEntry;
+
+// The are 2 partitions in the partition table in MBR 
+typedef PartEntry PartTable[4]; 
+
+//--------------------Partitions dof1 and dof2---------------------------
+//Defining the dof1 and dof2 partition table entries
+//-----------------------------------------------------------------------------
+static PartTable def_part_table =
 {
-	printk(KERN_ALERT"closing the file\n");
-	return 0;
-}
-static ssize_t adc_read(struct file *f, char __user *buf, size_t len, loff_t *off)
-{
-	printk(KERN_ALERT"ADC data read\n");
-	get_random_bytes(&m,2);
-	copy_to_user((int16_t*)buf, &m, 2);
-	
-	
-	return 0;
-}
-
-
-
-
-
-
-long device_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioctl_param)
-{
-	int adc_channel;
-	int adc_alignment;
-	int adc_mode;
-	
-	switch(ioctl_num){
-	/*IOCTL_SET_CHANNEL system call will allow selecting one of the channels from 0 to 8
-	
-	IOCTL_SET_ALIGNMENT systemcall will allow to select if the 12-bits must be left aligned or right aligned
-	
-	IOCTL_SET_MODE system call allows to select the mode of conversion required by the user. The function can be used to read the converted number. The output of this function will be a 16-bit number
-	
-	*/
-	case IOCTL_SET_CHANNEL:
-		adc_channel=(int)ioctl_param;
-		printk(KERN_ALERT"\nSelected Channel=%d",adc_channel);
-		break;
-	case IOCTL_SET_ALIGNMENT:
-		adc_alignment=(int)ioctl_param;
-	/*******L=1 : Left alignment is selected by the user
-	        L=0 : Right aligment is selected by the user*********/
-		if(adc_alignment==0)
-		{
-			printk(KERN_ALERT"\nSelected alignment= LEFT");
-			L=1;
-		}
-		else if(adc_alignment==1)
-		{
-			printk(KERN_ALERT"\nSelected alignment= RIGHT");
-			
-			L=0;
-		}
-		else
-		{
-			printk(KERN_ALERT"\n ERROR: Please enter a valid number");
-		}
-			
-		break;
-	case IOCTL_SET_MODE:
-	/*note that the data can be read only if the selected mode of conversion is ONE SHOT CONVERSION*/
-		adc_mode=(int)ioctl_param;
-		if(adc_mode==0)
-		{
-			printk(KERN_ALERT"\nSelected mode : ONE SHOT CONVERSION");
-			
-			O=1;
-			
-		}
-		else if(adc_mode==1)
-		{
-			printk(KERN_ALERT"\nSelected mode= CONTINUOUS CONVERSION");
-			O=0;
-		}
-		else
-		{
-			printk(KERN_ALERT"\n Error : Please enter a valid number");
-		}
-		
-		
-		break;
-		
-	case IOCTL_READ:/*note that the data can be read only if the selected mode of conversion is ONE SHOT CONVERSION*/
-		m=(int)ioctl_param;
-		
-		if(O==1)
-	        {
-			if(L==1)
-			{
-				
-				
-				adc_read(file, m,2,0);
-				m=(m & 1111111111110000);
-				printk(KERN_ALERT"\nm=%x",m);
-				
-				
-			}
-			else
-			{
-				
-				
-				adc_read(file, m,2,0);
-				m=(m & 0000111111111111);
-				printk(KERN_ALERT"\nm=%x",m);
-				
-				
-			
-			}
-		}
-			
-	}
-	return SUCCESS;
-}
-
-
- 
-/*---------------------------------------------------------------------*/
-//file operation structure
-static struct file_operations fops =
-{
-	.owner= THIS_MODULE,
-	.open= adc_open,
-	.release= adc_close,
-	.unlocked_ioctl= device_ioctl,
-	.read= adc_read
-	
+	{
+		boot_type: 0x00,
+		start_head: 0x00,
+		start_sec: 0x2,
+		start_cyl: 0x00,
+		part_type: 0x83,
+		end_head: 0x00,
+		end_sec: 0x20,
+		end_cyl: 0x09,
+		abs_start_sec: 0x00000001,
+		sec_in_part: 0x0000013F
+	},
+	{
+		boot_type: 0x00,
+		start_head: 0x00,
+		start_sec: 0x1,
+		start_cyl: 0x14,
+		part_type: 0x83,
+		end_head: 0x00,
+		end_sec: 0x20,
+		end_cyl: 0x1F,
+		abs_start_sec: 0x00000280,
+		sec_in_part: 0x00000180
+	},
+         
 };
-/*------------------------------------------------------------*/
 
-static int mychar_init(void)
+//------------------copy_mbr()-----------------------------------------
+//Function : used set up the MBR of the dof inside the
+//           dofdevice_init() function
+
+//-------------------------------------------------------------------------
+static void copy_mbr(u8 *disk)
 {
+struct file *dof_file;
+loff_t pos1=510;
+loff_t pos2=446;
+char data='A';
+//char *signature;
+//signature=&data;
+//signature=kmalloc(PAGE_SIZE,GFP_KERNEL);
+//strcpy(signature,data);
+	memset(disk, 0x0, MBR_SIZE);
+	*(unsigned long *)(disk + MBR_DISK_SIGNATURE_OFFSET) = 0x36E5756D;
+	memcpy(disk + PARTITION_TABLE_OFFSET, &def_part_table, PARTITION_TABLE_SIZE);
+	*(unsigned short *)(disk + MBR_SIGNATURE_OFFSET) = MBR_SIGNATURE;
+
+
+       
+	//Declaring file pointer 
+
+	//Opening file 
+	dof_file = filp_open("/etc/DiskOnFile.txt",  O_RDWR|O_CREAT, 0666);
+
+       kernel_write(dof_file,&data,MBR_SIGNATURE_SIZE, &pos1);
+       printk(KERN_ALERT "Checked Signature");
+       kernel_write(dof_file,&def_part_table,PARTITION_TABLE_SIZE, &pos2);
+printk(KERN_ALERT "Partition Table Completed");
+       //close the file
+	filp_close(dof_file,NULL); 
+        
+}
+
+
+//------------------dofdevice_init()-----------------------------------------
+//Function : for initialization of the Disk On File(DOF)
+//Output argument : Size of the file which is treted as a block disk device
+//                  (in terms of number of sectors)
+//-------------------------------------------------------------------------
+int dofdevice_init(void)
+{
+	dev_data = vmalloc(DOF_DEVICE_SIZE * DOF_SECTOR_SIZE);
+	if (dev_data == NULL)
+		return -ENOMEM;
+	/* Setup its partition table */
+	copy_mbr(dev_data);
+	return DOF_DEVICE_SIZE;
+}
+
+//------------------dofdevice_cleanup()-----------------------------------------
+//Function : This frees the memory space occupied by the dof.It calls the vfree() function and passes it dev_data as the 
+//           argument. 
+
+//-----------------------------------------------------------------------------
+
+void dofdevice_cleanup(void)
+{
+	vfree(dev_data);
+}
+
+//------------------dofdevice_writer()-----------------------------------------
+//Function : Writes data from a memory location into the dof
+//Input argument : (1) Sector offset 
+//                 (2) pointer to the data which isto be written
+//                 (3) number of sectors to write
+//Output argument : void
+//-----------------------------------------------------------------------------
+void dofdevice_write(sector_t sector_off, u8 *buffer, unsigned int sectors)
+{
+struct file *dof_file;
+loff_t pos;
+		pos=(loff_t)sector_off*DOF_SECTOR_SIZE;
+	memcpy(dev_data + sector_off * DOF_SECTOR_SIZE, buffer,
+		sectors * DOF_SECTOR_SIZE);
+		
+		
+
+	//open the file
+        //dof_file = file_open("DiskOnFile2.txt",  O_RDWR, 777);
+        
+
 	
-	printk(KERN_INFO"adc-dev registered");
-	if (alloc_chrdev_region(&number,1,1,"ADC-DEV")<0)
-	{
-		return -1;
-	}
-	printk(KERN_ALERT"<major, minor> : <%d, %d>\n",MAJOR(number), MINOR(number));
+	//Write into the file
+	//file_write(dof_file, sector_off*DOF_SECTOR_SIZE, buffer, sectors * DOF_SECTOR_SIZE);
+
+	//Declaring file pointer 
 	
-	
-	if((cls = class_create(THIS_MODULE,"chardev")) == NULL)
-	{
-		unregister_chrdev_region(number,1);
-		return -1;
-	}
-	if(device_create(cls, NULL, number, NULL, "adc-dev") == NULL)
-	{
-		printk(KERN_ALERT"Device not created!!!!!");
-		class_destroy(cls);
-		unregister_chrdev_region(number,1);
-		return 0;
-	}
-	
-	cdev_init(&cdev_adc, &fops);
-	if(cdev_add(&cdev_adc, number, 1) == -1)
-	{
-		device_destroy(cls, number);
-		class_destroy(cls);
-		unregister_chrdev_region(number,1);
-		return -1;
-	}
+
+	//Opening file 
+	dof_file = filp_open("/etc/DiskOnFile.txt",  O_WRONLY, 0666);
+
+ 	kernel_write(dof_file,buffer,sectors * DOF_SECTOR_SIZE,&pos);
+
+	//close the file
+	filp_close(dof_file,NULL); 
+}
+
+//------------------dofdevice_read()-----------------------------------------
+//Function : Reads data from dof and writes it into a memory location
+//Input argument : (1) Sector offset 
+//                 (2) pointer to the address where the data from thedisk is 
+//                     to be written 
+//                 (3) number of sectors to read from
+//Output argument : void
+//-----------------------------------------------------------------------------
+
+void dofdevice_read(sector_t sector_off, u8 *buffer, unsigned int sectors)
+{
+	struct file *dof_file;
+loff_t pos;
+		pos=(loff_t)sector_off*DOF_SECTOR_SIZE;
+	memcpy(buffer, dev_data + sector_off * DOF_SECTOR_SIZE,
+		sectors * DOF_SECTOR_SIZE);
+		
+
+	//Declaring file pointer 	
+
+	//open the file
+        dof_file = filp_open("/etc/DiskOnFile.txt",  O_RDONLY, 0666);
+
+	kernel_read(dof_file,buffer, sector_off*DOF_SECTOR_SIZE, &pos);
+
+ 	//close the file
+	filp_close(dof_file,NULL);
+        
+}
+
+
+static struct dof_device
+{
+	/* Size is the size of the device (in sectors) */
+	unsigned int size;
+	/* For exclusive access to our request queue */
+	spinlock_t lock;
+	/* Our request queue */
+	struct request_queue *dof_queue;
+	/* This is kernel's representation of an individual disk device */
+	struct gendisk *dof_disk;
+} dof_dev;
+
+
+//----------------------dof_open()---------------------
+//FUnction used to open the disk of file. 
+//----------------------------------------------------
+
+static int dof_open(struct block_device *bdev, fmode_t mode)
+{
+	unsigned unit = iminor(bdev->bd_inode);
+
+	printk(KERN_INFO "dof: Opening block device\n");
+	printk(KERN_INFO "dof: Inode number is %d\n", unit);
+
+	if (unit > DOF_MINOR_CNT)
+		return -ENODEV;
 	return 0;
 }
-		
-static void mychar_exit(void)
+
+//----------------------dof_close()---------------------
+//Function used to close the disk of file. 
+//----------------------------------------------------
+
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(3,10,0))
+static int dof_close(struct gendisk *disk, fmode_t mode)
 {
-	cdev_del(&cdev_adc);
-	device_destroy(cls, number);
-	class_destroy(cls);
-	unregister_chrdev_region(number, 1);
-	printk(KERN_INFO"adc-dev unregistered\n\n");
+	printk(KERN_INFO "dof: Closing the block device\n");
+	return 0;
+}
+#else
+static void dof_close(struct gendisk *disk, fmode_t mode)
+{
+	printk(KERN_INFO "dof: CLOSED the device\n");
+}
+#endif
+
+static int dof_getgeo(struct block_device *bdev, struct hd_geometry *geo)
+{
+	geo->heads = 1;
+	geo->cylinders = 32;
+	geo->sectors = 32;
+	geo->start = 0;
+	return 0;
 }
 
-module_init(mychar_init);
-module_exit(mychar_exit);
+//-----------------------dof_transfer()-----------------------
+//FUnction that does the Actual Data transfer
+//-----------------------------------------------------------
+static int dof_transfer(struct request *req)
+{
+
+	int dir = rq_data_dir(req);
+	sector_t start_sector = blk_rq_pos(req);
+	unsigned int sector_cnt = blk_rq_sectors(req);
+
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(3,14,0))
+#define BV_PAGE(bv) ((bv)->bv_page)
+#define BV_OFFSET(bv) ((bv)->bv_offset)
+#define BV_LEN(bv) ((bv)->bv_len)
+	struct bio_vec *bv;
+#else
+#define BV_PAGE(bv) ((bv).bv_page)
+#define BV_OFFSET(bv) ((bv).bv_offset)
+#define BV_LEN(bv) ((bv).bv_len)
+	struct bio_vec bv;
+#endif
+	struct req_iterator iter;
+
+	sector_t sector_offset;
+	unsigned int sectors;
+	u8 *buffer;
+
+	int ret = 0;
+
+	sector_offset = 0;
+	rq_for_each_segment(bv, req, iter)
+	{
+		buffer = page_address(BV_PAGE(bv)) + BV_OFFSET(bv);
+		if (BV_LEN(bv) % DOF_SECTOR_SIZE != 0)
+		{
+			printk(KERN_ERR "dof: Should never happen: "
+				"bio size (%d) is not a multiple of DOF_SECTOR_SIZE (%d).\n"
+				"This may lead to data truncation.\n",
+				BV_LEN(bv), DOF_SECTOR_SIZE);
+			ret = -EIO;
+		}
+		sectors = BV_LEN(bv) / DOF_SECTOR_SIZE;
+		printk(KERN_DEBUG "dof: Start Sector: %llu, Sector Offset: %llu; Buffer: %p; Length: %u sectors\n",
+			(unsigned long long)(start_sector), (unsigned long long)(sector_offset), buffer, sectors);
+		if (dir == WRITE) /* Write to the device */
+		{
+			dofdevice_write(start_sector + sector_offset, buffer, sectors);
+		}
+		else /* Read from the device */
+		{
+			dofdevice_read(start_sector + sector_offset, buffer, sectors);
+		}
+		sector_offset += sectors;
+	}
+	if (sector_offset != sector_cnt)
+	{
+		printk(KERN_ERR "dof: bio info doesn't match with the request info");
+		ret = -EIO;
+	}
+
+	return ret;
+}
+	
+//----------------------dof_request()-------------------------
+// Represents a block I/O request for us to execute
+//-------------------------------------------------------------
+static void dof_request(struct request_queue *q)
+{
+	struct request *req;
+	int ret;
+
+	/* Gets the current request from the dispatch queue */
+	while ((req = blk_fetch_request(q)) != NULL)
+	{
+		ret = dof_transfer(req);
+		__blk_end_request_all(req, ret);
+	}
+}
+
+//------------------------------------------------------------------------
+// These are the file operations that performed on the dof block device
+//------------------------------------------------------------------------
+static struct block_device_operations dof_fops =
+{
+	.owner = THIS_MODULE,
+	.open = dof_open,
+	.release = dof_close,
+	.getgeo = dof_getgeo,
+};
+	
+static int __init dof_init(void)
+{
+
+	int ret;
+
+	/* Set up our DOF Device */
+	if ((ret = dofdevice_init()) < 0)
+	{
+		return ret;
+	}
+	dof_dev.size = ret;
+
+	/* Get Registered */
+	dof_major = register_blkdev(dof_major, "dof");
+	if (dof_major <= 0)
+	{
+		printk(KERN_ERR "dof: Unable to get Major Number\n");
+		dofdevice_cleanup();
+		return -EBUSY;
+	}
+
+	/* Get a request queue (here queue is created) */
+	spin_lock_init(&dof_dev.lock);
+	dof_dev.dof_queue = blk_init_queue(dof_request, &dof_dev.lock);
+	if (dof_dev.dof_queue == NULL)
+	{
+		printk(KERN_ERR "dof: blk_init_queue failure\n");
+		unregister_blkdev(dof_major, "dof");
+		dofdevice_cleanup();
+		return -ENOMEM;
+	}
+	
+	/*
+	 * Add the gendisk structure
+	 * By using this memory allocation is involved, 
+	 * the minor number we need to pass bcz the device 
+	 * will support this much partitions 
+	 */
+	dof_dev.dof_disk = alloc_disk(DOF_MINOR_CNT);
+	if (!dof_dev.dof_disk)
+	{
+		printk(KERN_ERR "dof: alloc_disk failure\n");
+		blk_cleanup_queue(dof_dev.dof_queue);
+		unregister_blkdev(dof_major, "dof");
+		dofdevice_cleanup();
+		return -ENOMEM;
+	}
+
+ 	/* Setting the major number */
+	dof_dev.dof_disk->major = dof_major;
+  	/* Setting the first mior number */
+	dof_dev.dof_disk->first_minor = DOF_FIRST_MINOR;
+ 	/* Initializing the device operations */
+	dof_dev.dof_disk->fops = &dof_fops;
+ 	/* Driver-specific own internal data */
+	dof_dev.dof_disk->private_data = &dof_dev;
+	dof_dev.dof_disk->queue = dof_dev.dof_queue;
+	/*
+	 * You do not want partition information to show up in 
+	 * cat /proc/partitions set this flags
+	 */
+	//dof_dev.dof_disk->flags = GENHD_FL_SUPPRESS_PARTITION_INFO;
+	sprintf(dof_dev.dof_disk->disk_name, "dof");
+	/* Setting the capacity of the device in its gendisk structure */
+	set_capacity(dof_dev.dof_disk, dof_dev.size);
+
+	/* Adding the disk to the system */
+	add_disk(dof_dev.dof_disk);
+	/* Now the disk is "live" */
+	printk(KERN_INFO "dof: DOF Block driver initialised (%d sectors; %d bytes)\n",
+		dof_dev.size, dof_dev.size * DOF_SECTOR_SIZE);
+
+	return 0;
+}
+
+//-------------------------------dof_cleanup()--------------------------------
+// This is the unregistration and uninitialization section of the dof block
+// device driver
+//----------------------------------------------------------------------------
+static void __exit dof_cleanup(void)
+{       
+
+
+	del_gendisk(dof_dev.dof_disk);
+	put_disk(dof_dev.dof_disk);
+	blk_cleanup_queue(dof_dev.dof_queue);
+	unregister_blkdev(dof_major, "dof");
+	dofdevice_cleanup();
+}
+
+//----------Initialisation------ 
+module_init(dof_init);
+
+//-------Exiting-------
+module_exit(dof_cleanup);
+
+//Module Information 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Assignment-1 , Configuration of a virtual ADC");
-MODULE_AUTHOR("Urvi Barapatre - 2021H1400161P");
+MODULE_AUTHOR("Urvi Barapatre");
+MODULE_ALIAS_BLOCKDEV_MAJOR(dof_major);
+
+//----------------------------------END-------------------------------------
 
